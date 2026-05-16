@@ -1,0 +1,291 @@
+# omnivoice.cpp — multi-backend release pipeline
+#
+# Triggers on version tags (v*). Builds pre-compiled binaries for every
+# supported {OS × backend} combination, packages them as zip archives,
+# and publishes a GitHub Release with all artifacts attached.
+#
+# Matrix:
+#   Linux   : cpu, cuda-12, vulkan
+#   Windows : cpu, cuda-12, vulkan
+#   macOS   : cpu (Metal via GGML_METAL, universal binary)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow manual dispatch for testing the pipeline without a tag.
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name (e.g. v0.1.0). Leave empty for a dry-run without publishing."
+        required: false
+        default: ""
+
+permissions:
+  contents: write          # needed by softprops/action-gh-release
+
+# Cancel previous runs on the same ref so we don't waste runner minutes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+#  Reusable fragments
+# ---------------------------------------------------------------------------
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # =========================================================================
+  #  Build matrix
+  # =========================================================================
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux ──────────────────────────────────────────────────────
+          - name: linux-cpu
+            os: ubuntu-22.04
+            cmake_flags: "-DGGML_BLAS=ON"
+            artifact: omnivoice-linux-cpu
+
+          - name: linux-cuda-12
+            os: ubuntu-22.04
+            cuda: "12.6.3"
+            cmake_flags: "-DGGML_CUDA=ON"
+            artifact: omnivoice-linux-cuda-12
+
+          - name: linux-vulkan
+            os: ubuntu-22.04
+            vulkan: true
+            cmake_flags: "-DGGML_VULKAN=ON"
+            artifact: omnivoice-linux-vulkan
+
+          # ── Windows ───────────────────────────────────────────────────
+          - name: win-cpu
+            os: windows-2022
+            cmake_flags: ""
+            artifact: omnivoice-win-cpu
+
+          - name: win-cuda-12
+            os: windows-2022
+            cuda: "12.6.3"
+            cmake_flags: "-DGGML_CUDA=ON"
+            artifact: omnivoice-win-cuda-12
+
+          - name: win-vulkan
+            os: windows-2022
+            vulkan: true
+            cmake_flags: "-DGGML_VULKAN=ON"
+            artifact: omnivoice-win-vulkan
+
+          # ── macOS (Metal, universal) ──────────────────────────────────
+          - name: macos-metal
+            os: macos-14                # Apple Silicon runner
+            cmake_flags: "-DGGML_METAL=ON -DCMAKE_OSX_ARCHITECTURES='arm64;x86_64'"
+            artifact: omnivoice-macos-metal
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # ── checkout ────────────────────────────────────────────────────
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0           # full history so version.cmake gets a hash
+
+      # ── CUDA toolkit (Linux & Windows) ─────────────────────────────
+      - name: Install CUDA toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+
+      # ── Vulkan SDK ─────────────────────────────────────────────────
+      - name: Install Vulkan SDK (Linux)
+        if: matrix.vulkan && runner.os == 'Linux'
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Install Vulkan SDK (Windows)
+        if: matrix.vulkan && runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1.0.5
+        with:
+          vulkan_version: 1.3.290.0
+          install_runtime: true
+          cache: true
+          optional_components: com.lunarg.vulkan.vma
+          stripdown: true
+
+      # ── Linux dependencies (BLAS for CPU build) ────────────────────
+      - name: Install OpenBLAS (Linux CPU)
+        if: runner.os == 'Linux' && !matrix.cuda && !matrix.vulkan
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      # ── Configure ──────────────────────────────────────────────────
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          ${{ matrix.cmake_flags }}
+
+      # ── Build (Unix) ─────────────────────────────────────────────────
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j "$(nproc)"
+
+      # ── Build (Windows) ────────────────────────────────────────────────
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j $env:NUMBER_OF_PROCESSORS
+
+      # ── Package (Linux / macOS) ────────────────────────────────────
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          # Copy main binaries
+          for bin in omnivoice-tts omnivoice-codec quantize; do
+            [ -f "build/$bin" ] && cp "build/$bin" staging/
+          done
+          # Copy shared libs (ggml backends, libomnivoice if present)
+          find build -maxdepth 2 \( -name "*.so" -o -name "*.dylib" \) \
+            -exec cp {} staging/ \;
+          # Metal shader (macOS)
+          find build -maxdepth 2 -name "*.metal" -exec cp {} staging/ \;
+          # Include public header + docs
+          cp src/omnivoice.h staging/
+          cp README.md LICENSE staging/
+          # Create archive
+          cd staging
+          tar czf "../${{ matrix.artifact }}.tar.gz" .
+
+      # ── Package (Windows) ──────────────────────────────────────────
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          # Copy main binaries
+          $exes = @("omnivoice-tts.exe", "omnivoice-codec.exe", "quantize.exe")
+          foreach ($exe in $exes) {
+            $path = "build/${{ env.BUILD_TYPE }}/$exe"
+            if (Test-Path $path) { Copy-Item $path staging/ }
+          }
+          # Copy DLLs (ggml backends, CUDA runtime, Vulkan loader)
+          Get-ChildItem -Path build -Recurse -Include "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName staging/
+          }
+          # Include public header + docs
+          Copy-Item src/omnivoice.h staging/
+          Copy-Item README.md staging/
+          Copy-Item LICENSE staging/
+          # Create zip
+          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
+
+      # ── Upload build artifact (Unix) ───────────────────────────────
+      - name: Upload artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+      # ── Upload build artifact (Windows) ────────────────────────────
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  # =========================================================================
+  #  Publish GitHub Release
+  # =========================================================================
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name != '')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          cat > notes.md << 'NOTES_EOF'
+          ## omnivoice.cpp $TAG
+
+          Pre-compiled binaries for all supported backends. Download the archive
+          matching your OS and GPU, extract, and run `omnivoice-tts` directly.
+
+          ### Downloads
+
+          | Archive | OS | Backend | GPU |
+          |---|---|---|---|
+          | `omnivoice-linux-cpu.tar.gz` | Linux x86_64 | CPU (OpenBLAS) | — |
+          | `omnivoice-linux-cuda-12.tar.gz` | Linux x86_64 | CUDA 12 | NVIDIA |
+          | `omnivoice-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | AMD / Intel / NVIDIA |
+          | `omnivoice-win-cpu.zip` | Windows x64 | CPU | — |
+          | `omnivoice-win-cuda-12.zip` | Windows x64 | CUDA 12 | NVIDIA |
+          | `omnivoice-win-vulkan.zip` | Windows x64 | Vulkan | AMD / Intel / NVIDIA |
+          | `omnivoice-macos-metal.tar.gz` | macOS (Universal) | Metal | Apple Silicon / Intel |
+
+          ### Quick start
+
+          ```bash
+          echo "Hello world." | ./omnivoice-tts \
+              --model models/omnivoice-base-Q8_0.gguf \
+              --codec models/omnivoice-tokenizer-F32.gguf \
+              --lang English -o hello.wav
+          ```
+
+          > Models are **not** included in the binary archives.
+          > Download pre-converted GGUFs from https://huggingface.co/Serveurperso/OmniVoice-GGUF
+          NOTES_EOF
+          # Substitute the tag into the notes
+          sed -i "s/\$TAG/$TAG/g" notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "omnivoice.cpp ${{ steps.tag.outputs.name }}"
+          body_path: notes.md
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.name, 'rc') || contains(steps.tag.outputs.name, 'beta') || contains(steps.tag.outputs.name, 'alpha') }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

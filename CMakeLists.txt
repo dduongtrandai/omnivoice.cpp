@@ -24,7 +24,7 @@ find_package(Threads REQUIRED)
 # lang-map.h, text-chunker.h) survive the compile without a BOM.
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-    add_compile_options(/utf-8)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
 endif()
 
 # Put executables and backend .so in the same directory (build root).

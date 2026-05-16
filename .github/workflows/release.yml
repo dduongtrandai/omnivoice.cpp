@@ -140,10 +140,24 @@ jobs:
         if: runner.os == 'Linux' && !matrix.cuda && !matrix.vulkan
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
 
-      # ── Configure ──────────────────────────────────────────────────
-      - name: Configure CMake
+      # ── MSVC dev environment (Windows, needed for Ninja) ────────────
+      - name: Setup MSVC dev environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # ── Configure (Unix) ────────────────────────────────────────────
+      - name: Configure CMake (Unix)
+        if: runner.os != 'Windows'
         run: >
           cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          ${{ matrix.cmake_flags }}
+
+      # ── Configure (Windows with Ninja) ──────────────────────────────
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: >
+          cmake -B build -G Ninja
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           ${{ matrix.cmake_flags }}
 
@@ -188,7 +202,7 @@ jobs:
           # Copy main binaries
           $exes = @("omnivoice-tts.exe", "omnivoice-codec.exe", "quantize.exe")
           foreach ($exe in $exes) {
-            $path = "build/${{ env.BUILD_TYPE }}/$exe"
+            $path = "build/$exe"
             if (Test-Path $path) { Copy-Item $path staging/ }
           }
           # Copy DLLs (ggml backends, CUDA runtime, Vulkan loader)

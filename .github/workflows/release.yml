@@ -58,6 +58,8 @@ jobs:
             cuda: "12.6.2"
             cmake_flags: "-DGGML_CUDA=ON"
             artifact: omnivoice-linux-cuda-12
+            sub_packages: '["nvcc", "cudart"]'
+            non_cuda_sub_packages: '["libcublas-dev-12-6", "libcurand-dev-12-6"]'
 
           - name: linux-vulkan
             os: ubuntu-22.04
@@ -76,6 +78,8 @@ jobs:
             cuda: "12.6.2"
             cmake_flags: "-DGGML_CUDA=ON"
             artifact: omnivoice-win-cuda-12
+            sub_packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev"]'
+            non_cuda_sub_packages: '[]'
 
           - name: win-vulkan
             os: windows-2022
@@ -108,7 +112,8 @@ jobs:
         with:
           cuda: ${{ matrix.cuda }}
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev"]'
+          sub-packages: ${{ matrix.sub_packages }}
+          non-cuda-sub-packages: ${{ matrix.non_cuda_sub_packages }}
 
       # ── Vulkan SDK ─────────────────────────────────────────────────
       - name: Install Vulkan SDK (Linux)

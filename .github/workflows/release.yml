@@ -59,7 +59,7 @@ jobs:
             cmake_flags: "-DGGML_CUDA=ON"
             artifact: omnivoice-linux-cuda-12
             sub_packages: '["nvcc", "cudart"]'
-            non_cuda_sub_packages: '["libcublas-dev-12-6", "libcurand-dev-12-6"]'
+            non_cuda_sub_packages: '["libcublas-dev", "libcurand-dev"]'
 
           - name: linux-vulkan
             os: ubuntu-22.04

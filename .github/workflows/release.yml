@@ -78,7 +78,7 @@ jobs:
             cuda: "12.6.2"
             cmake_flags: "-DGGML_CUDA=ON"
             artifact: omnivoice-win-cuda-12
-            sub_packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev"]'
+            sub_packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "visual_studio_integration"]'
             non_cuda_sub_packages: '[]'
 
           - name: win-vulkan

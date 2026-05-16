@@ -151,6 +151,7 @@ jobs:
         run: >
           cmake -B build
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DOMNIVOICE_SHARED=ON
           ${{ matrix.cmake_flags }}
 
       # ── Configure (Windows with Ninja) ──────────────────────────────
@@ -159,6 +160,7 @@ jobs:
         run: >
           cmake -B build -G Ninja
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DOMNIVOICE_SHARED=ON
           ${{ matrix.cmake_flags }}
 
       # ── Build (Unix) ─────────────────────────────────────────────────
@@ -184,6 +186,9 @@ jobs:
           # Copy shared libs (ggml backends, libomnivoice if present)
           find build -maxdepth 2 \( -name "*.so" -o -name "*.dylib" \) \
             -exec cp {} staging/ \;
+          # Static import library (if present)
+          find build -maxdepth 2 -name "*.a" -path "*/libomnivoice*" \
+            -exec cp {} staging/ \;
           # Metal shader (macOS)
           find build -maxdepth 2 -name "*.metal" -exec cp {} staging/ \;
           # Include public header + docs
@@ -205,8 +210,12 @@ jobs:
             $path = "build/$exe"
             if (Test-Path $path) { Copy-Item $path staging/ }
           }
-          # Copy DLLs (ggml backends, CUDA runtime, Vulkan loader)
+          # Copy DLLs (ggml backends, omnivoice shared lib, CUDA runtime, Vulkan loader)
           Get-ChildItem -Path build -Recurse -Include "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName staging/
+          }
+          # Copy import libraries (.lib) for linking against the shared lib
+          Get-ChildItem -Path build -Recurse -Include "omnivoice.lib" | ForEach-Object {
             Copy-Item $_.FullName staging/
           }
           # Include public header + docs

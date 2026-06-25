@@ -47,6 +47,65 @@ struct PipelineTTS {
     bool clamp_fp16;
 };
 
+struct TtsProgress {
+    ov_progress_cb cb          = nullptr;
+    void *         user_data   = nullptr;
+    int            current     = 0;
+    int            total       = 0;
+    int            chunk_index = 0;
+    int            chunk_count = 1;
+    bool           cancelled   = false;
+};
+
+static inline bool tts_progress_begin(TtsProgress * progress, int total, const char * stage) {
+    if (!progress || !progress->cb) {
+        return true;
+    }
+    progress->current     = 0;
+    progress->total       = total > 0 ? total : 1;
+    progress->chunk_index = 0;
+    progress->chunk_count = progress->chunk_count > 0 ? progress->chunk_count : 1;
+    progress->cancelled   = false;
+    if (!progress->cb(progress->current, progress->total, stage, progress->chunk_index, progress->chunk_count,
+                      progress->user_data)) {
+        progress->cancelled = true;
+        return false;
+    }
+    return true;
+}
+
+static inline bool tts_progress_advance(TtsProgress * progress,
+                                        int           delta,
+                                        const char *  stage,
+                                        int           chunk_index = -1,
+                                        int           chunk_count = -1) {
+    if (!progress || !progress->cb) {
+        return true;
+    }
+    if (progress->cancelled) {
+        return false;
+    }
+    if (delta <= 0) {
+        return true;
+    }
+    if (chunk_index >= 0) {
+        progress->chunk_index = chunk_index;
+    }
+    if (chunk_count > 0) {
+        progress->chunk_count = chunk_count;
+    }
+    progress->current += delta;
+    if (progress->current > progress->total) {
+        progress->current = progress->total;
+    }
+    if (!progress->cb(progress->current, progress->total, stage, progress->chunk_index, progress->chunk_count,
+                      progress->user_data)) {
+        progress->cancelled = true;
+        return false;
+    }
+    return true;
+}
+
 // Load the LLM GGUF, copy all weights to the backend, close the GGUF mapping.
 // Returns true on success. Leaves the struct in a clean state on failure.
 bool pipeline_tts_load(PipelineTTS * pt, const char * gguf_path, BackendPair bp, bool use_fa, bool clamp_fp16);
@@ -140,7 +199,10 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const int32_t *       ref_audio_tokens,
                                            int                   ref_T,
                                            const char *          dump_dir,
-                                           uint32_t *            ctr_lo_inout = nullptr);
+                                           uint32_t *            ctr_lo_inout = nullptr,
+                                           TtsProgress *         progress     = nullptr,
+                                           int                   chunk_index  = 0,
+                                           int                   chunk_count  = 1);
 
 // Validate and normalise the raw instruct string against the voice-design
 // vocabulary. The target language is selected from the synthesis text: any

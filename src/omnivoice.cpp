@@ -207,6 +207,8 @@ void ov_tts_default_params(struct ov_tts_params * p) {
     p->on_chunk                = nullptr;
     p->on_chunk_user_data      = nullptr;
     p->postproc                = true;
+    p->on_progress             = nullptr;
+    p->on_progress_user_data   = nullptr;
 }
 
 struct ov_context * ov_init(const struct ov_init_params * params) {

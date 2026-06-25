@@ -6,7 +6,7 @@ rem rd /s /q build 2>nul
 mkdir build 2>nul
 cd build
 
-cmake .. -DGGML_CUDA=ON
+cmake .. -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
 cmake --build . --config Release -j %NUMBER_OF_PROCESSORS%
 
 cd ..

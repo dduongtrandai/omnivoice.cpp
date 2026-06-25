@@ -137,7 +137,10 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                                              const MaskgitConfig & cfg,
                                              int                   T,
                                              const char *          dump_dir     = nullptr,
-                                             uint32_t *            ctr_lo_inout = nullptr) {
+                                             uint32_t *            ctr_lo_inout = nullptr,
+                                             TtsProgress *         progress     = nullptr,
+                                             int                   chunk_index  = 0,
+                                             int                   chunk_count  = 1) {
     const int K       = prompt->K;
     const int B_prime = prompt->B_prime;
     const int S       = prompt->S_max;
@@ -178,6 +181,9 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
     for (int step = 0; step < cfg.num_step; step++) {
         int k_demask = sched[step];
         if (k_demask <= 0) {
+            if (!tts_progress_advance(progress, 1, "maskgit", chunk_index, chunk_count)) {
+                return {};
+            }
             continue;
         }
 
@@ -353,6 +359,9 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
 
         fprintf(stderr, "[MaskGIT-Step] %d/%d demask=%d remaining=%d\n", step + 1, cfg.num_step, k_demask,
                 (int) std::count(tokens.begin(), tokens.end(), mask_id));
+        if (!tts_progress_advance(progress, 1, "maskgit", chunk_index, chunk_count)) {
+            return {};
+        }
     }
 
     fprintf(stderr, "[MaskGIT] Total LM forward: %.2f ms across %d steps (avg %.2f ms/step)\n", fwd_total_ms,

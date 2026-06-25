@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version(); for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 3
+#define OV_ABI_VERSION 4
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -146,6 +146,20 @@ typedef bool (*ov_cancel_cb)(void * user_data);
 // runs roughly 6 to 12 dB below the buffered path. Logged at INFO when this
 // branch fires.
 typedef bool (*ov_audio_chunk_cb)(const float * samples, int n_samples, void * user_data);
+
+// Synthesis progress callback. current / total are monotonic work units for
+// this ov_synthesize call. MaskGIT reports one unit per iterative decoder
+// step; codec decode, cross-fade and post-processing each report one unit.
+// chunk_index is 1-based while inside a text chunk, or 0 for whole-utterance
+// stages. chunk_count is 1 for single-shot output. stage is a static
+// NUL-terminated string such as "maskgit", "codec_decode", "cross_fade" or
+// "postproc". Returning false aborts synthesis with OV_STATUS_CANCELLED.
+typedef bool (*ov_progress_cb)(int current,
+                               int total,
+                               const char * stage,
+                               int chunk_index,
+                               int chunk_count,
+                               void * user_data);
 
 // Log severity. Numerically ordered so a callback can filter with a
 // simple `if (level < threshold) return;`. ERROR is reserved for failure
@@ -247,12 +261,16 @@ struct ov_tts_params {
     // either way. Tail field: kept last for ABI growth, read only when
     // abi_version >= 3. The streaming path always post filters.
     bool postproc;
+
+    // Progress callback. Tail fields: read only when abi_version >= 4.
+    ov_progress_cb on_progress;
+    void *         on_progress_user_data;
 };
 
 // Initialise to the standard defaults. Strings NULL, T_override 0,
 // chunk_duration_sec 15, chunk_threshold_sec 30, denoise true,
 // preprocess_prompt true, MaskGIT defaults as above, every reference
-// pointer NULL, dump_dir NULL, cancel NULL, postproc true.
+// pointer NULL, dump_dir NULL, cancel NULL, postproc true, progress NULL.
 OV_API void ov_tts_default_params(struct ov_tts_params * p);
 
 // Run the full TTS synthesis. Resolves the instruct against the bundled

@@ -21,7 +21,10 @@ find_package(Threads REQUIRED)
 
 # Suppress MSVC fopen/sprintf deprecation warnings, force UTF-8 source and
 # execution charsets so non-ASCII string literals (CJK in voice-design.h,
-# lang-map.h, text-chunker.h) survive the compile without a BOM.
+# lang-map.h, text-chunker.h) survive the compile without a BOM. /utf-8 is
+# restricted to C and C++ since nvcc treats a bare /utf-8 as an input
+# filename and aborts with "A single input file is required". CUDA sources
+# do not carry CJK literals so they do not need this flag.
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
@@ -37,7 +40,8 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 add_compile_definitions(GGML_MAX_NAME=128)
 
 # Harden: mark fread/fwrite/etc with warn_unused_result on all platforms
-if(NOT MSVC)
+# SYCL excluded: _FORTIFY_SOURCE swaps memcpy for __memcpy_chk, unresolved in device code
+if(NOT MSVC AND NOT GGML_SYCL)
     add_compile_definitions(_FORTIFY_SOURCE=2)
 endif()
 
@@ -54,6 +58,19 @@ endif()
 
 # ggml as subdirectory, inherits GGML_CUDA, GGML_METAL, etc. from cmake flags
 add_subdirectory(ggml)
+
+# cpp-httplib (HTTP server library, no SSL, behind reverse proxy in prod).
+# Used by tts-server.
+add_subdirectory(vendor/cpp-httplib)
+
+# yyjson (MIT, fast JSON parser/writer). Used by tts-server.
+add_library(yyjson STATIC vendor/yyjson/yyjson.c)
+target_include_directories(yyjson PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/yyjson)
+if(MSVC)
+    target_compile_options(yyjson PRIVATE /W0)
+else()
+    target_compile_options(yyjson PRIVATE -w)
+endif()
 
 # Shared compile options and ggml linkage
 macro(link_ggml_backends target)
@@ -75,7 +92,7 @@ macro(link_ggml_backends target)
     if(TARGET ggml-base)
         target_link_libraries(${target} PRIVATE ggml-base)
     endif()
-    foreach(backend cpu blas cuda metal vulkan)
+    foreach(backend cpu blas cuda metal vulkan sycl)
         if(TARGET ggml-${backend})
             get_target_property(CURRENT_BACKEND_TYPE ggml-${backend} TYPE)
             if (CURRENT_BACKEND_TYPE STREQUAL "MODULE_LIBRARY")
@@ -86,6 +103,11 @@ macro(link_ggml_backends target)
             target_link_libraries(${target} PRIVATE ggml-${backend})
         endif()
     endforeach()
+
+    # SYCL links its runtime PRIVATE, consumers need -fsycl to resolve libsycl.so
+    if(TARGET ggml-sycl AND GGML_SYCL)
+        target_link_options(${target} PRIVATE -fsycl)
+    endif()
     add_dependencies(${target} version)
 endmacro()
 
@@ -141,6 +163,12 @@ link_ggml_backends(omnivoice-codec)
 add_executable(omnivoice-tts tools/omnivoice-tts.cpp)
 target_link_libraries(omnivoice-tts PRIVATE omnivoice-core)
 link_ggml_backends(omnivoice-tts)
+
+# tts-server : OpenAI-compatible HTTP server over the TTS pipeline.
+# Always built : it is part of the project, not an optional add-on.
+add_executable(tts-server tools/tts-server.cpp)
+target_link_libraries(tts-server PRIVATE omnivoice-core httplib yyjson)
+link_ggml_backends(tts-server)
 
 # test-abi-c : pure C99 smoke test that locks in the public ABI contract.
 # Compiles omnivoice.h with a C compiler under -Wall -Werror -pedantic and

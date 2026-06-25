@@ -20,6 +20,7 @@
 #include "pipeline-codec.h"
 #include "prompt-tts.h"
 #include "text-chunker.h"
+#include "timer.h"
 #include "voice-design.h"
 
 #include <cmath>
@@ -238,6 +239,7 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
     struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
     ggml_build_forward_expand(graph, logits);
 
+    ggml_backend_sched_reset(pt->sched);
     if (!ggml_backend_sched_alloc_graph(pt->sched, graph)) {
         ov_log(OV_LOG_ERROR, "[LM-Forward] sched_alloc_graph failed (K=%d S=%d)", K, S);
         ggml_free(gctx);
@@ -552,6 +554,7 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *             pt
         ggml_build_forward_expand(graph, logits);
     }
 
+    ggml_backend_sched_reset(pt->sched);
     if (!ggml_backend_sched_alloc_graph(pt->sched, graph)) {
         ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] sched_alloc_graph failed (B'=%d K=%d S=%d)", B_prime, K, S);
         ggml_free(gctx);
@@ -682,8 +685,11 @@ static std::vector<float> tts_synthesize_one_chunk(PipelineTTS *         pt,
                                                    int                   ref_T,
                                                    const char *          dump_dir,
                                                    uint32_t *            ctr_lo_inout) {
+    Timer                t_total;
+    Timer                t_gen;
     std::vector<int32_t> tokens = pipeline_tts_generate(pt, tok, text, lang, instruct, T, denoise, mg_cfg, ref_text,
                                                         ref_audio_tokens, ref_T, dump_dir, ctr_lo_inout);
+    const double         gen_ms = t_gen.ms();
     if (tokens.empty()) {
         return {};
     }
@@ -711,11 +717,21 @@ static std::vector<float> tts_synthesize_one_chunk(PipelineTTS *         pt,
     debug_dump_i32_as_f32(&dbg, "mg-tokens", tokens.data(), tokens_shape, 2);
 
     ov_log(OV_LOG_INFO, "[TTS] Decode: K=%d T=%d expected_samples=%d", K, T, T * pc->hop_length);
-    std::vector<float> audio = pipeline_codec_decode(pc, tokens.data(), K, T);
+    Timer              t_codec;
+    std::vector<float> audio    = pipeline_codec_decode(pc, tokens.data(), K, T);
+    const double       codec_ms = t_codec.ms();
 
     if (!audio.empty()) {
         debug_dump_1d(&dbg, "output-audio", audio.data(), (int) audio.size());
     }
+
+    const double total_ms = t_total.ms();
+    const double audio_sec =
+        pc->sample_rate > 0 ? (double) T * (double) pc->hop_length / (double) pc->sample_rate : 0.0;
+    const double rtf = audio_sec > 0.0 ? (total_ms / 1000.0) / audio_sec : 0.0;
+    ov_log(OV_LOG_INFO, "[Perf] Generate %.1f ms (MaskGIT, %d steps)", gen_ms, mg_cfg.num_step);
+    ov_log(OV_LOG_INFO, "[Perf] CodecDecode %.1f ms", codec_ms);
+    ov_log(OV_LOG_INFO, "[Perf] Total %.1f ms (T=%d, audio %.2f s, RTF %.3f)", total_ms, T, audio_sec, rtf);
     return audio;
 }
 
@@ -742,6 +758,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
                                                        float                 chunk_duration_sec,
                                                        float                 chunk_threshold_sec,
                                                        bool                  denoise,
+                                                       bool                  postproc,
                                                        const MaskgitConfig & mg_cfg,
                                                        const std::string &   ref_text,
                                                        const int32_t *       ext_ref_tokens,
@@ -904,16 +921,22 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
         ov_log(OV_LOG_INFO, "[TTS-Long] Cross-faded %d chunks -> %zu samples", (int) chunk_audios.size(), audio.size());
     }
 
-    // Post-processing: matches _post_process_audio in omnivoice.py.
-    // remove_silence and fade_and_pad always run. The volume branch picks
-    // peak/0.5 when there is no reference (ref_rms < 0), or rescales by
-    // ref_rms / 0.1 for a quiet reference, or stays no-op for a loud one.
+    // Post filtering: remove_silence and fade_and_pad mirror
+    // _post_process_audio in omnivoice.py and run when postproc is set.
+    // peak_normalize_half is a per utterance normalisation, also gated so a
+    // timeline assembler can normalise once globally instead. The reference
+    // loudness branch (ref_rms scaling) is part of voice cloning and always
+    // runs. postproc false leaves the raw decode at exactly T * hop samples.
     size_t before = audio.size();
 
-    remove_silence(audio, sr, 500, 100, 100, -50.0);
+    if (postproc) {
+        remove_silence(audio, sr, 500, 100, 100, -50.0);
+    }
 
     if (ref_rms < 0.0f) {
-        peak_normalize_half(audio);
+        if (postproc) {
+            peak_normalize_half(audio);
+        }
     } else if (ref_rms < 0.1f) {
         float k = ref_rms / 0.1f;
         for (auto & s : audio) {
@@ -921,7 +944,9 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
         }
     }
 
-    fade_and_pad(audio, sr, 0.1, 0.1);
+    if (postproc) {
+        fade_and_pad(audio, sr, 0.1, 0.1);
+    }
 
     ov_log(OV_LOG_INFO, "[TTS-Long] Post-proc: %zu -> %zu samples (%.2fs at %d Hz, ref_rms=%.4f)", before, audio.size(),
            (float) audio.size() / (float) sr, sr, ref_rms);
@@ -1194,22 +1219,21 @@ struct RefEncoded {
     bool                 has_ref;
     std::vector<int32_t> ref_codes;
     int                  ref_T;
-    std::string          ref_text;
     float                ref_rms_for_postproc;
 };
 
 // Encodes the optional raw reference waveform into RVQ codes. Mirrors the
-// upstream reference preprocessing chain: add_punctuation / RMS / auto-gain
-// / silence-trim / hop alignment / codec encode. Returns has_ref=false when
-// no reference is supplied. Returns has_ref=true with ref_codes empty on
-// encode failure (caller distinguishes via ref_codes.empty()).
-static RefEncoded tts_encode_ref(PipelineTTS *       pt,
-                                 PipelineCodec *     pc,
-                                 const float *       ref_audio_24k,
-                                 int                 ref_n_samples,
-                                 const std::string & ref_text_in,
-                                 bool                preprocess_prompt,
-                                 const char *        dump_dir) {
+// upstream reference preprocessing chain via ref_preprocess_audio (RMS /
+// auto-gain / silence-trim), then hop alignment and codec encode. Returns
+// has_ref=false when no reference is supplied. Returns has_ref=true with
+// ref_codes empty on encode failure (caller distinguishes via
+// ref_codes.empty()).
+static RefEncoded tts_encode_ref(PipelineTTS *   pt,
+                                 PipelineCodec * pc,
+                                 const float *   ref_audio_24k,
+                                 int             ref_n_samples,
+                                 bool            preprocess_prompt,
+                                 const char *    dump_dir) {
     RefEncoded r           = {};
     r.has_ref              = false;
     r.ref_T                = 0;
@@ -1218,46 +1242,15 @@ static RefEncoded tts_encode_ref(PipelineTTS *       pt,
     if (ref_audio_24k == NULL || ref_n_samples <= 0) {
         return r;
     }
-    r.has_ref  = true;
-    r.ref_text = ref_text_in;
-
-    // Mirror Python preprocess_prompt: append a terminal "." (or ideographic
-    // full stop for CJK) when missing.
-    if (preprocess_prompt) {
-        r.ref_text = add_punctuation(r.ref_text);
-    }
+    r.has_ref = true;
 
     std::vector<float> ref_audio(ref_audio_24k, ref_audio_24k + ref_n_samples);
 
-    // Mirror Python OmniVoice: compute ref_rms once on the loaded waveform.
-    // Auto loudness normalisation when ref RMS is in (0, 0.1). Scales the
-    // buffer so the new RMS hits exactly 0.1; the ORIGINAL ref_rms is what
-    // we plumb into the post-proc to rescale the generated output back to
+    // Shared reference preprocessing: RMS auto-gain unconditionally,
+    // silence trim when preprocess_prompt. The ORIGINAL RMS is what we
+    // plumb into the post-proc to rescale the generated output back to
     // the reference loudness.
-    double sumsq = 0.0;
-    for (float v : ref_audio) {
-        sumsq += (double) v * (double) v;
-    }
-
-    double ref_rms         = std::sqrt(sumsq / (double) ref_audio.size());
-    r.ref_rms_for_postproc = (float) ref_rms;
-
-    if (ref_rms > 0.0 && ref_rms < 0.1) {
-        float gain = (float) (0.1 / ref_rms);
-        for (float & v : ref_audio) {
-            v *= gain;
-        }
-
-        ov_log(OV_LOG_INFO, "[TTS] Reference: RMS %.4f -> 0.1 gain %.4f", ref_rms, gain);
-    }
-
-    // Mirror Python preprocess_prompt: silence-trim the reference clip with
-    // mid=200ms, lead=100ms, trail=200ms, threshold=-50 dBFS before encoding.
-    if (preprocess_prompt) {
-        size_t before = ref_audio.size();
-        remove_silence(ref_audio, 24000, 200, 100, 200, -50.0);
-        ov_log(OV_LOG_INFO, "[TTS] Reference: silence-trim %zu -> %zu samples", before, ref_audio.size());
-    }
+    r.ref_rms_for_postproc = ref_preprocess_audio(ref_audio, 24000, preprocess_prompt);
 
     int n_in      = (int) ref_audio.size();
     int n_aligned = (n_in / pc->hop_length) * pc->hop_length;
@@ -1328,6 +1321,13 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     std::string raw_instruct(params->instruct ? params->instruct : "");
     std::string ref_text(params->ref_text ? params->ref_text : "");
 
+    // Mirror Python preprocess_prompt: append a terminal "." (or
+    // ideographic full stop for CJK) when missing. Applied before the
+    // raw/tokens routing so both reference formats see the same text.
+    if (params->preprocess_prompt && !ref_text.empty()) {
+        ref_text = add_punctuation(ref_text);
+    }
+
     // Resolve the raw instruct against the voice-design vocabulary. The
     // target language is selected from the synthesis text: any CJK ideograph
     // -> Chinese, otherwise English.
@@ -1358,9 +1358,8 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     // Encode the optional raw reference once, before any synthesis. has_raw
     // false leaves the struct empty with ref_rms_for_postproc=-1, routing the
     // post-proc volume branch to peak / 0.5 (buffered) or skip (streaming).
-    RefEncoded re =
-        tts_encode_ref(pt, pc, has_raw ? params->ref_audio_24k : nullptr, has_raw ? params->ref_n_samples : 0, ref_text,
-                       params->preprocess_prompt, params->dump_dir);
+    RefEncoded re = tts_encode_ref(pt, pc, has_raw ? params->ref_audio_24k : nullptr,
+                                   has_raw ? params->ref_n_samples : 0, params->preprocess_prompt, params->dump_dir);
     if (has_raw && re.has_ref && re.ref_codes.empty()) {
         ov_set_error("ov_synthesize : reference encoding failed (see [TTS] log lines)");
         return OV_STATUS_GENERATE_FAILED;
@@ -1368,7 +1367,8 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
 
     // Resolve the reference triple fed to the synthesis helpers. Three
     // routes: raw waveform freshly encoded, pre-encoded tokens passed in,
-    // or pure TTS with no reference at all.
+    // or pure TTS with no reference at all. ref_text is preprocessed once
+    // upstream and identical on both reference routes.
     const int32_t * synth_ref_tokens = nullptr;
     int             synth_ref_T      = 0;
     std::string     synth_ref_text   = "";
@@ -1377,7 +1377,7 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     if (has_raw && re.has_ref) {
         synth_ref_tokens = re.ref_codes.data();
         synth_ref_T      = re.ref_T;
-        synth_ref_text   = re.ref_text;
+        synth_ref_text   = ref_text;
         synth_ref_rms    = re.ref_rms_for_postproc;
     } else if (has_tokens) {
         synth_ref_tokens = params->ref_audio_tokens;
@@ -1404,9 +1404,19 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
         return rc;
     }
 
-    std::vector<float> audio = tts_synthesize_long_internal(
-        pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec, params->chunk_threshold_sec,
-        params->denoise, mg_cfg, synth_ref_text, synth_ref_tokens, synth_ref_T, synth_ref_rms, params->dump_dir, &cc);
+    // Post filtering toggle. Tail field of ov_tts_params: only valid when
+    // the caller declares abi_version >= 3, older callers keep the reference
+    // behaviour (on). Threaded into the buffered path only, the streaming
+    // path always post filters.
+    bool postproc = true;
+    if (params->abi_version >= 3) {
+        postproc = params->postproc;
+    }
+
+    std::vector<float> audio =
+        tts_synthesize_long_internal(pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec,
+                                     params->chunk_threshold_sec, params->denoise, postproc, mg_cfg, synth_ref_text,
+                                     synth_ref_tokens, synth_ref_T, synth_ref_rms, params->dump_dir, &cc);
 
     if (cc.triggered) {
         ov_set_error("ov_synthesize : cancelled by ov_cancel_cb");

@@ -135,6 +135,17 @@ jobs:
           optional_components: com.lunarg.vulkan.vma
           stripdown: true
 
+      - name: Install SPIRV-Headers (Windows Vulkan)
+        if: matrix.vulkan && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkgRoot = if ([string]::IsNullOrWhiteSpace($env:VCPKG_INSTALLATION_ROOT)) { "C:\vcpkg" } else { $env:VCPKG_INSTALLATION_ROOT }
+          & (Join-Path $vcpkgRoot "vcpkg.exe") install spirv-headers:x64-windows
+          $prefix = Join-Path $vcpkgRoot "installed\x64-windows"
+          $include = Join-Path $prefix "include"
+          "CMAKE_PREFIX_PATH=$prefix;$env:CMAKE_PREFIX_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INCLUDE=$include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       # ── Linux dependencies (BLAS for CPU build) ────────────────────
       - name: Install OpenBLAS (Linux CPU)
         if: runner.os == 'Linux' && !matrix.cuda && !matrix.vulkan

@@ -37,6 +37,14 @@ concurrency:
 
 env:
   BUILD_TYPE: Release
+  # Release binaries must run on generic x86_64/AVX2 machines. GitHub hosted
+  # runners may expose AVX-512, so never let ggml tune CPU code to the runner.
+  DISTRIBUTED_CPU_FLAGS: >-
+    -DGGML_NATIVE=OFF
+    -DGGML_AVX512=OFF
+    -DGGML_AVX512_VBMI=OFF
+    -DGGML_AVX512_VNNI=OFF
+    -DGGML_AVX512_BF16=OFF
 
 jobs:
   # =========================================================================
@@ -163,6 +171,7 @@ jobs:
           cmake -B build
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           -DOMNIVOICE_SHARED=ON
+          ${{ env.DISTRIBUTED_CPU_FLAGS }}
           ${{ matrix.cmake_flags }}
 
       # ── Configure (Windows with Ninja) ──────────────────────────────
@@ -172,6 +181,7 @@ jobs:
           cmake -B build -G Ninja
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           -DOMNIVOICE_SHARED=ON
+          ${{ env.DISTRIBUTED_CPU_FLAGS }}
           ${{ matrix.cmake_flags }}
 
       # ── Build (Unix) ─────────────────────────────────────────────────

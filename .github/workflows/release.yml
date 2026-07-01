@@ -235,6 +235,23 @@ jobs:
           Get-ChildItem -Path build -Recurse -Include "*.dll" | ForEach-Object {
             Copy-Item $_.FullName staging/
           }
+          # CUDA runtime DLLs are installed by Jimver/cuda-toolkit but are not
+          # build outputs. Bundle them so Windows CUDA archives are self-contained
+          # like upstream whisper.cpp CUDA releases.
+          if ('${{ matrix.cuda }}' -ne '') {
+            if ([string]::IsNullOrWhiteSpace($env:CUDA_PATH)) {
+              throw "CUDA_PATH is not set; cannot package CUDA runtime DLLs."
+            }
+            $cudaBin = Join-Path $env:CUDA_PATH "bin"
+            $cudaDlls = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+            foreach ($dll in $cudaDlls) {
+              $src = Join-Path $cudaBin $dll
+              if (-not (Test-Path -LiteralPath $src)) {
+                throw "Required CUDA runtime DLL not found: $src"
+              }
+              Copy-Item -LiteralPath $src -Destination staging/ -Force
+            }
+          }
           # Copy import libraries (.lib) for linking against the shared lib
           Get-ChildItem -Path build -Recurse -Include "omnivoice.lib" | ForEach-Object {
             Copy-Item $_.FullName staging/
